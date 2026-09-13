@@ -1357,10 +1357,34 @@ function pickDirInteractive() {
 }
 
 /**
+ * 回读目录，确认文件真的落到磁盘上了（不能只看 API 没报错）。
+ * 这是「完全确认」的关键一步。
+ */
+async function listWrittenFiles(sub) {
+  const out = [];
+  try {
+    for await (const entry of sub.values()) {
+      if (entry.kind !== 'file') continue;
+      let size = 0, modified = 0;
+      try {
+        const f = await entry.getFile();
+        size = f.size; modified = f.lastModified;
+      } catch (e) { /* 拿不到大小不算失败 */ }
+      out.push({ name: entry.name, size: size, modified: modified });
+    }
+  } catch (e) {
+    console.error('回读目录失败', e);
+  }
+  out.sort((a, b) => (a.name > b.name ? 1 : -1));
+  return out;
+}
+
+/**
  * 把当前记录的全部截图按顺序写进
  *   <你选的文件夹> / 售后反馈照片 / <客户名_日期_时间> / 01_xxx.png
+ * 写完后**回读目录核对**，只有真的读到文件才算成功。
  * 同一条记录重复导出会写进同一个文件夹（不会每次都新建）。
- * @returns {Promise<{dir:object, n:number, folder:string}|null>}
+ * @returns {Promise<{dir:object, n:number, folder:string, files:Array}|null>}
  */
 async function exportImagesToFolder(interactive) {
   if (!state.images.length) { toast('这条记录还没有附件', 'err'); return null; }
@@ -1380,11 +1404,12 @@ async function exportImagesToFolder(interactive) {
     root = await dir.getDirectoryHandle(PHOTO_ROOT, { create: true });
     sub = await root.getDirectoryHandle(folder, { create: true });
   } catch (e) {
-    toast('无法在所选文件夹里建目录：' + (e && e.message ? e.message : e), 'err');
+    toast('无法在「' + dir.name + '」里建目录：' + (e && e.message ? e.message : e)
+      + '　请确认这个文件夹允许写入', 'err');
     return null;
   }
 
-  let n = 0;
+  let failed = 0;
   for (let i = 0; i < state.images.length; i++) {
     const im = state.images[i];
     const ext = im.type === 'image/jpeg' ? '.jpg' : '.png';
@@ -1394,24 +1419,39 @@ async function exportImagesToFolder(interactive) {
       const w = await fh.createWritable();
       await w.write(dataUrlToBlob(im.dataUrl, im.type));
       await w.close();
-      n++;
     } catch (e) {
+      failed++;
       console.error('写入失败', name, e);
     }
   }
 
-  if (!n) { toast('图片写入失败，请检查文件夹权限', 'err'); return null; }
+  /* ---- 关键：回读目录核对，不信写入接口的"没报错" ---- */
+  const readBack = await listWrittenFiles(sub);
+  const good = readBack.filter(f => f.size > 0);
 
-  // 锁定文件夹名 + 记住导出时间
-  if (state.current) {
-    state.current.photoFolder = folder;
-    state.current.photoFolderLocked = true;
-    state.current.photoExportedAt = Date.now();
-    state.current.photoExportedCount = n;
+  if (!good.length) {
+    toast('写入后回读目录是空的 —— 导出没成功。请确认「' + dir.name
+      + '」这个文件夹允许写入', 'err');
+    state.current.photoFiles = [];
+    state.current.photoFolderLocked = false;
+    state.current.photoExportedAt = 0;
     await saveCurrent(true);
+    renderDirBox();
+    renderSendHint();
+    return null;
   }
+
+  state.current.photoFolder = folder;
+  state.current.photoFolderLocked = true;
+  state.current.photoFiles = good;
+  state.current.photoExportedAt = Date.now();
+  state.current.photoExportedCount = good.length;
+  await saveCurrent(true);
   renderDirBox();
-  return { dir, n, folder };
+  renderSendHint();
+
+  if (failed) toast('有 ' + failed + ' 张写入失败，已成功 ' + good.length + ' 张', 'err');
+  return { dir, n: good.length, folder, files: good };
 }
 
 async function prepareSend() {
@@ -1425,11 +1465,7 @@ async function prepareSend() {
   if (!state.images.length) return;
 
   const r = await exportImagesToFolder(true);
-  if (r) {
-    toast('文字已复制 · ' + r.n + ' 张图已存到「' + PHOTO_ROOT + '/' + r.folder + '」', 'ok');
-    renderSendHint();
-    renderDirBox();
-  }
+  if (r) toast('✓ 文字已复制 · ' + r.n + ' 个文件已确认写入', 'ok');
 }
 
 /* ---- 侧栏「照片存到哪」 ---- */
@@ -1438,69 +1474,124 @@ function renderDirBox() {
   if (!box) return;
   box.innerHTML = '';
 
+  const rec = state.current;
   const n = state.images.length;
-  const folder = state.current ? recordFolderName(state.current) : PHOTO_ROOT;
+  const folder = rec ? recordFolderName(rec) : PHOTO_ROOT;
+  const done = !!(rec && rec.photoExportedAt && (rec.photoFiles || []).length);
 
-  const tree = document.createElement('div');
-  tree.className = 'dir-tree';
-
-  if (dirHandle) {
-    tree.appendChild(dirRow('📁', dirHandle.name, '你选的', 0));
-    tree.appendChild(dirRow('📁', PHOTO_ROOT, '总目录', 1));
-    tree.appendChild(dirRow('📂', folder, '这条反馈', 2, true));
-  } else {
+  /* --- 还没选文件夹 --- */
+  if (!dirHandle) {
     const empty = document.createElement('div');
     empty.className = 'empty-tip';
     empty.style.padding = '14px 8px';
-    empty.textContent = '还没有选文件夹。点右上角「选择文件夹」挑一个位置，建议直接选桌面。';
-    tree.appendChild(empty);
+    empty.textContent = '还没有选文件夹。点下面的按钮挑一个位置，'
+      + '建议先在桌面上建一个专门的文件夹（比如 001）再选它。';
+    box.appendChild(empty);
+
+    const b = document.createElement('button');
+    b.className = 'btn sm primary';
+    b.style.width = '100%';
+    b.textContent = '选择文件夹';
+    b.onclick = pickDirInteractive;
+    box.appendChild(b);
+
+    const note = document.createElement('div');
+    note.className = 'dir-note';
+    note.innerHTML = '浏览器出于安全<b>不会告诉我们文件夹的完整路径</b>，'
+      + '所以这里只能显示文件夹的名字。';
+    box.appendChild(note);
+    return;
   }
+
+  /* --- 有图但还没导出：醒目提醒 --- */
+  if (!done && n) {
+    const warn = document.createElement('div');
+    warn.className = 'dir-warn';
+    warn.innerHTML = '⚠️ <b>照片还没有导出</b><br>'
+      + '下面这条路径目前<b>只是预告，磁盘上还不存在</b>。'
+      + '点「导出这 ' + n + ' 张」才会真正写入。';
+    box.appendChild(warn);
+  }
+
+  /* --- 目录树：区分「已创建」和「还没创建」 --- */
+  const tree = document.createElement('div');
+  tree.className = 'dir-tree';
+  tree.appendChild(dirRow(dirHandle.name, '你选的', 0, false, true));
+  tree.appendChild(dirRow(PHOTO_ROOT, done ? '已创建' : '待创建', 1, false, done));
+  tree.appendChild(dirRow(folder, done ? '已创建' : '待创建', 2, true, done));
   box.appendChild(tree);
 
-  // 按钮
+  /* --- 按钮 --- */
   const acts = document.createElement('div');
   acts.className = 'dir-actions';
 
   const bPick = document.createElement('button');
   bPick.className = 'btn sm';
-  bPick.textContent = dirHandle ? '更改文件夹' : '选择文件夹';
+  bPick.textContent = '更改文件夹';
   bPick.onclick = pickDirInteractive;
   acts.appendChild(bPick);
 
   if (n) {
     const bGo = document.createElement('button');
     bGo.className = 'btn sm primary';
-    bGo.textContent = '导出这 ' + n + ' 张';
+    bGo.textContent = done ? '重新导出' : '导出这 ' + n + ' 张';
     bGo.onclick = async () => {
       const r = await exportImagesToFolder(true);
-      if (r) toast('已导出 ' + r.n + ' 张到「' + PHOTO_ROOT + '/' + r.folder + '」', 'ok');
+      if (r) toast('✓ 已确认写入 ' + r.n + ' 个文件', 'ok');
     };
     acts.appendChild(bGo);
   }
   box.appendChild(acts);
 
-  // 说明
-  const note = document.createElement('div');
-  note.className = 'dir-note';
-  if (!n) {
-    note.innerHTML = '左边加了截图后，点上面的按钮就能导出。'
-      + '<br>浏览器出于安全<b>不会告诉你文件夹的完整路径</b>，认准上面这个名字去找就行。';
-  } else if (state.current && state.current.photoExportedAt) {
-    note.innerHTML = '上次导出：' + fmtTime(state.current.photoExportedAt)
-      + '，共 ' + (state.current.photoExportedCount || 0) + ' 张。'
-      + '<br>同一份反馈反复导出会写进<b>同一个文件夹</b>，不会越导越多。';
+  /* --- 结果 --- */
+  if (done) {
+    const ok = document.createElement('div');
+    ok.className = 'dir-result';
+
+    const head = document.createElement('div');
+    head.className = 'dir-result-head';
+    head.textContent = '✓ 已确认写入 ' + rec.photoFiles.length + ' 个文件 · '
+      + fmtTime(rec.photoExportedAt);
+    ok.appendChild(head);
+
+    const ul = document.createElement('div');
+    ul.className = 'dir-files';
+    rec.photoFiles.forEach(f => {
+      const li = document.createElement('div');
+      li.className = 'dir-file';
+      const nm = document.createElement('span');
+      nm.className = 'nm'; nm.textContent = f.name; nm.title = f.name;
+      const sz = document.createElement('span');
+      sz.className = 'sz'; sz.textContent = fmtSize(f.size);
+      li.appendChild(nm); li.appendChild(sz);
+      ul.appendChild(li);
+    });
+    ok.appendChild(ul);
+    box.appendChild(ok);
+
+    const note = document.createElement('div');
+    note.className = 'dir-note';
+    note.innerHTML = '上面就是<b>真实读回来的文件清单</b>，'
+      + '到系统里打开这个文件夹核对一下。'
+      + '同一条反馈反复导出只会覆盖同一个文件夹。';
+    box.appendChild(note);
   } else {
-    note.innerHTML = '<b>一条反馈一个文件夹</b>，照片按 <b>01_、02_</b> 顺序命名，'
-      + '找照片直接进「' + PHOTO_ROOT + '」就行。';
+    const note = document.createElement('div');
+    note.className = 'dir-note';
+    note.innerHTML = n
+      ? '导出后这里会列出<b>实际写入的文件清单</b>，用来核对。'
+      : '左边加了截图后，点上面的按钮就能导出。';
+    box.appendChild(note);
   }
-  box.appendChild(note);
 }
 
-function dirRow(icon, name, tag, level, isLast) {
+function dirRow(name, tag, level, isLast, created) {
   const row = document.createElement('div');
-  row.className = 'dir-row' + (level ? ' lvl' + level : '') + (isLast ? ' last' : '');
+  row.className = 'dir-row' + (level ? ' lvl' + level : '')
+    + (isLast ? ' last' : '') + (level ? (created ? ' done' : ' pending') : '');
   const i = document.createElement('span');
-  i.className = 'ico'; i.textContent = icon;
+  i.className = 'ico';
+  i.textContent = created ? '📂' : (level ? '📁' : '📁');
   const nm = document.createElement('span');
   nm.className = 'nm'; nm.textContent = name;
   nm.title = name;
@@ -1522,13 +1613,25 @@ function renderSendHint() {
       + '左边加了截图（直接 <b>Ctrl+V</b> 粘贴）后，这里会给出完整发送流程。';
     return;
   }
+
+  const rec = state.current;
+  const done = !!(rec && rec.photoExportedAt && (rec.photoFiles || []).length);
   const where = dirHandle
-    ? '「' + PHOTO_ROOT + '/' + recordFolderName(state.current) + '」'
-    : '你选的文件夹（第一次点会弹窗挑一个）';
-  el.innerHTML = '<b>准备发送</b>一次做两件事：<br>'
-    + '① 文字复制到剪贴板（真文本，可搜索）<br>'
-    + '② ' + n + ' 张截图按顺序导出到 ' + where + '<br>'
-    + '然后到群里：<b>Ctrl+V 粘文字</b> → 打开那个文件夹<b>全选图片拖进聊天窗口</b>。';
+    ? '「' + PHOTO_ROOT + ' / ' + recordFolderName(rec) + '」'
+    : '你选定的文件夹（第一次点会弹窗挑一个）';
+
+  if (done) {
+    el.innerHTML = '✓ <b>这条反馈已经准备好了</b><br>'
+      + '① 文字在剪贴板里（真文本，可搜索）<br>'
+      + '② <b>' + rec.photoFiles.length + ' 个文件</b>已写入 ' + where + '，'
+      + '侧栏卡片里有完整清单<br>'
+      + '到群里：<b>Ctrl+V 粘文字</b> → 打开那个文件夹<b>全选图片拖进聊天窗口</b>。';
+  } else {
+    el.innerHTML = '点【<b>准备发送</b>】会做两件事：<br>'
+      + '① 把上面的文字复制到剪贴板（真文本，可搜索）<br>'
+      + '② 把 <b>' + n + ' 张截图</b>写入 ' + where + '<br>'
+      + '<b style="color:#d97706">现在还没有导出</b>，点一下才会真正写入磁盘。';
+  }
 }
 
 
