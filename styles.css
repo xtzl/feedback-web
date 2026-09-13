@@ -55,9 +55,12 @@ html, body {
   margin: 0;
   padding: 0;
   height: 100%;
+  overflow: hidden;
 }
 
 body {
+  display: flex;
+  flex-direction: column;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
     "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
   font-size: 14px;
@@ -77,6 +80,7 @@ header.topbar {
   position: sticky;
   top: 0;
   z-index: 40;
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -301,6 +305,7 @@ header.topbar {
   display: flex;
   gap: 2px;
   padding: 0 18px;
+  flex: 0 0 auto;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
   overflow-x: auto;
@@ -330,19 +335,70 @@ header.topbar {
   background: var(--accent);
 }
 
-/* ---------------- 布局 ---------------- */
+/* ---------------- 布局 ----------------
+   大屏：整页不滚动，左右两栏各自独立滚动
+   小屏（<=1080px）：退回整页滚动，单列堆叠
+   -------------------------------------- */
 main.layout {
+  flex: 1 1 auto;
+  min-height: 0;
+  align-self: center;
+  width: 100%;
+  max-width: 1560px;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 400px;
   gap: 18px;
   padding: 18px;
-  align-items: start;
-  max-width: 1560px;
-  margin: 0 auto;
+  align-items: stretch;
+  overflow: hidden;
+}
+
+/* 左栏：卡片头固定，表单区自己滚 */
+main.layout > section.card {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+main.layout > section.card > .card-head { flex: 0 0 auto; }
+main.layout > section.card > .card-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* 右栏：整列自己滚 */
+aside.side {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 5px;
+}
+/* 关键：不让里面的卡片被 flex 压缩，否则内容会撑不开、出不来滚动条 */
+aside.side > * {
+  flex: 0 0 auto;
 }
 
 @media (max-width: 1080px) {
-  main.layout { grid-template-columns: minmax(0, 1fr); }
+  html, body { overflow: auto; height: auto; min-height: 100%; }
+  body { display: block; }
+  header.topbar { position: static; }
+  main.layout {
+    display: block;
+    overflow: visible;
+    padding: 14px;
+  }
+  main.layout > section.card { overflow: visible; }
+  main.layout > section.card > .card-body { overflow: visible; }
+  aside.side {
+    overflow: visible;
+    padding-right: 0;
+    margin-top: 18px;
+  }
 }
 
 .card {
@@ -474,6 +530,23 @@ main.layout {
 }
 .chip:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 
+/* 📌 常用信息胶囊 —— 点一下填入字段 */
+.chip.pinned {
+  border-color: rgba(37, 99, 235, .45);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chip.pinned:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
 .urgency-help {
   margin-top: 4px;
   border: 1px dashed var(--border-strong);
@@ -582,18 +655,6 @@ main.layout {
 .thumb .ops button.del:hover { background: var(--danger); }
 
 /* ---------------- 预览 ---------------- */
-aside.side {
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
-  position: sticky;
-  top: 76px;
-}
-
-@media (max-width: 1080px) {
-  aside.side { position: static; }
-}
-
 pre.preview {
   margin: 0;
   padding: 14px 16px;
