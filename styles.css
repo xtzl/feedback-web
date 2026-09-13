@@ -114,6 +114,76 @@ header.topbar {
   margin-left: 2px;
 }
 
+.brand .ver {
+  padding: 1px 6px;
+  border-radius: 20px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--faint);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: .3px;
+}
+
+/* 照片存放路径树 */
+.dir-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.dir-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 7px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  min-width: 0;
+}
+.dir-row .ico { flex-shrink: 0; font-size: 12px; }
+.dir-row .nm {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.dir-row.lvl1 { margin-left: 14px; }
+.dir-row.lvl2 { margin-left: 28px; }
+.dir-row.last {
+  background: var(--accent-soft);
+  border-color: rgba(37, 99, 235, .35);
+}
+.dir-row.last .nm { color: var(--accent); font-weight: 600; }
+.dir-row .tag {
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 0 6px;
+  border-radius: 20px;
+  font-size: 10px;
+  color: var(--faint);
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+.dir-row.last .tag { color: var(--accent); border-color: rgba(37, 99, 235, .3); }
+
+.dir-actions { display: flex; gap: 6px; margin-top: 10px; }
+.dir-actions .btn { flex: 1; }
+
+.dir-note {
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px dashed var(--border);
+  font-size: 11.5px;
+  color: var(--muted);
+  line-height: 1.7;
+}
+.dir-note b { color: var(--text); font-weight: 600; }
+
 .topbar .spacer { flex: 1; }
 
 .save-state {
@@ -492,15 +562,6 @@ pre.preview.empty { color: var(--faint); font-style: italic; }
   color: var(--muted);
 }
 .send-hint b { color: var(--text); font-weight: 600; }
-.send-hint .dir {
-  display: inline-block;
-  padding: 1px 7px;
-  border-radius: 20px;
-  background: var(--accent-soft);
-  border: 1px solid rgba(37, 99, 235, .3);
-  color: var(--accent);
-  font-weight: 600;
-}
 
 /* ---------------- 历史 ---------------- */
 .history-list {
