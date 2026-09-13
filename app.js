@@ -416,6 +416,7 @@ async function addFiles(fileList) {
   }
   syncImageCount();
   renderImages();
+  renderSendHint();
   renderHistory();
   scheduleSaveNow();
   if (ok) toast('已添加 ' + ok + ' 张图片', 'ok');
@@ -470,6 +471,7 @@ async function loadRecord(rec) {
   syncImageCount();
   renderImages();
   renderPreview();
+  renderSendHint();
   renderHistory();
   updateHeaderCount();
 }
@@ -716,16 +718,32 @@ function buildImagesField(f) {
     label.appendChild(h);
   }
   const sp = document.createElement('span');
-  sp.style.marginLeft = 'auto';
-  sp.style.display = 'flex';
-  sp.style.gap = '6px';
+  sp.className = 'field-tools';
+
+  const btnDir = document.createElement('button');
+  btnDir.type = 'button';
+  btnDir.className = 'btn sm';
+  btnDir.textContent = '导出图片';
+  btnDir.title = '把全部截图按顺序写入你指定的文件夹，方便一次拖进聊天窗口';
+  btnDir.onclick = () => exportImagesToFolder(true);
+  sp.appendChild(btnDir);
 
   const btnZip = document.createElement('button');
   btnZip.type = 'button';
   btnZip.className = 'btn sm';
-  btnZip.textContent = '打包下载';
+  btnZip.textContent = '打包 zip';
+  btnZip.title = '全部截图打包成一个 zip 文件';
   btnZip.onclick = downloadAllImages;
   sp.appendChild(btnZip);
+
+  const btnLong = document.createElement('button');
+  btnLong.type = 'button';
+  btnLong.className = 'btn sm';
+  btnLong.textContent = '合成一张图';
+  btnLong.title = '把文字和全部截图合成一张长图存成 PNG（注意：图里的文字不能被搜索）';
+  btnLong.onclick = downloadSummaryImage;
+  sp.appendChild(btnLong);
+
   label.appendChild(sp);
   wrap.appendChild(label);
 
@@ -811,6 +829,7 @@ function renderImages() {
       state.images = state.images.filter(x => x.id !== im.id);
       syncImageCount();
       renderImages();
+      renderSendHint();
       renderPreview();
       renderHistory();
       await saveCurrent(true);
@@ -954,7 +973,7 @@ async function copyText(text) {
   if (!text) { toast('还没有内容可以复制', 'err'); return; }
   try {
     await navigator.clipboard.writeText(text);
-    toast('已复制全文，去群里 Ctrl+V 吧', 'ok');
+    toast('文字已复制（真文本，可搜索）', 'ok');
   } catch (e) {
     const ta = document.createElement('textarea');
     ta.value = text;
@@ -962,7 +981,7 @@ async function copyText(text) {
     ta.style.opacity = '0';
     document.body.appendChild(ta);
     ta.select();
-    try { document.execCommand('copy'); toast('已复制全文', 'ok'); }
+    try { document.execCommand('copy'); toast('文字已复制', 'ok'); }
     catch (e2) { toast('复制失败，请手动选中预览区复制', 'err'); }
     ta.remove();
   }
@@ -1201,7 +1220,7 @@ async function downloadSummaryImage() {
     const v = state.current.values;
     const base = String(v.customer || v.problem || '反馈')
       .replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 28);
-    downloadBlob(blob, base + '_' + fmtTime(Date.now()).replace(/[-: ]/g, '') + '_长图.png');
+    downloadBlob(blob, base + '_' + stamp14() + '_长图.png');
     toast('长图已保存', 'ok');
   } catch (e) {
     console.error(e);
@@ -1245,7 +1264,7 @@ function downloadOneImage(im, i) {
 function downloadAllImages() {
   if (!state.images.length) { toast('还没有图片', 'err'); return; }
   const v = state.current.values;
-  const stamp = fmtTime(Date.now()).replace(/[-: ]/g, '');
+  const stamp = stamp14();
   const base = ((v.customer || v.problem || '反馈') + '_' + stamp)
     .replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40);
 
@@ -1262,6 +1281,128 @@ function downloadAllImages() {
     state.images.forEach((im, i) => setTimeout(() => downloadOneImage(im, i), i * 350));
   });
 }
+
+/* ---------------------------------------------------------
+   11.6 导出图片到文件夹 / 一键准备发送
+   —— 文字走剪贴板保持"真文本"（可搜索），图片走文件保持"真图片"
+   --------------------------------------------------------- */
+let dirHandle = null;
+
+function fileBase() {
+  const v = state.current.values;
+  return String(v.customer || v.problem || v.quote || '反馈')
+    .replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 28) || '反馈';
+}
+
+/** 到秒的紧凑时间戳，用作文件夹/文件名后缀，避免同一分钟内重复导出互相覆盖 */
+function stamp14(ts) {
+  const d = new Date(ts || Date.now());
+  return String(d.getFullYear()) + pad2(d.getMonth() + 1) + pad2(d.getDate())
+    + pad2(d.getHours()) + pad2(d.getMinutes()) + pad2(d.getSeconds());
+}
+
+function pickDir() {
+  if (!window.showDirectoryPicker) return Promise.resolve(null);
+  return window.showDirectoryPicker({ id: 'fb-export', mode: 'readwrite', startIn: 'desktop' })
+    .catch(() => null);      // 用户取消
+}
+
+async function ensureDir(interactive) {
+  if (dirHandle) {
+    try {
+      if (await dirHandle.queryPermission({ mode: 'readwrite' }) === 'granted') return dirHandle;
+      if (interactive && await dirHandle.requestPermission({ mode: 'readwrite' }) === 'granted') return dirHandle;
+    } catch (e) { /* 句柄失效，重新选 */ }
+    dirHandle = null;
+  }
+  if (!interactive) return null;
+  const h = await pickDir();
+  if (h) {
+    dirHandle = h;
+    try { await dbMetaSet('exportDir', h); renderSendHint(); } catch (e) {}
+  }
+  return h;
+}
+
+/**
+ * 把当前记录的全部截图按顺序写进用户指定的文件夹。
+ * 每次新建一个以「客户名_时间」命名的子文件夹，避免和历史文件混在一起。
+ * @returns {Promise<{dir:FileSystemDirectoryHandle, n:number}|null>}
+ */
+async function exportImagesToFolder(interactive) {
+  if (!state.images.length) { toast('这条记录还没有附件', 'err'); return null; }
+
+  const dir = await ensureDir(interactive !== false);
+  if (!dir) {
+    if (!window.showDirectoryPicker) {
+      toast('当前浏览器不支持选择文件夹，已改为逐张下载', 'err');
+      state.images.forEach((im, i) => setTimeout(() => downloadOneImage(im, i), i * 320));
+    }
+    return null;
+  }
+
+  const subName = fileBase() + '_' + stamp14();
+  let sub;
+  try {
+    sub = await dir.getDirectoryHandle(subName, { create: true });
+  } catch (e) {
+    toast('无法在该文件夹里新建子目录：' + (e && e.message ? e.message : e), 'err');
+    return null;
+  }
+
+  let n = 0;
+  for (let i = 0; i < state.images.length; i++) {
+    const im = state.images[i];
+    const ext = im.type === 'image/jpeg' ? '.jpg' : '.png';
+    const name = pad2(i + 1) + '_' + (im.name || '截图').replace(/\.[^.]+$/, '') + ext;
+    try {
+      const fh = await sub.getFileHandle(name, { create: true });
+      const w = await fh.createWritable();
+      await w.write(dataUrlToBlob(im.dataUrl, im.type));
+      await w.close();
+      n++;
+    } catch (e) {
+      console.error('写入失败', name, e);
+    }
+  }
+
+  if (!n) { toast('图片写入失败，请检查文件夹权限', 'err'); return null; }
+  return { dir, sub, n, subName };
+}
+
+async function prepareSend() {
+  if (!state.current) return;
+  const tpl = TEMPLATES[state.current.template];
+  const text = tpl.format(state.current.values, state.images.length).trim();
+
+  if (!text) { toast('还没有内容可以复制', 'err'); return; }
+
+  await copyText(text);
+  if (!state.images.length) return;
+
+  const r = await exportImagesToFolder(true);
+  if (r) {
+    toast('文字已复制 · ' + r.n + ' 张图已存到「' + r.dir.name + '/' + r.subName + '」', 'ok');
+    renderSendHint();
+  }
+}
+
+function renderSendHint() {
+  const el = $('#sendHint');
+  if (!el) return;
+  const n = state.images.length;
+  if (!n) {
+    el.innerHTML = '这是<b>真文本</b> —— 复制后粘到群里可以选中、可以搜索。<br>'
+      + '左边加了截图后，这里会多出「准备发送」的完整流程提示。';
+    return;
+  }
+  const dirTxt = dirHandle ? '<span class="dir">' + dirHandle.name + '</span>' : '<b>第一次点会弹窗让你选一个文件夹</b>（建议选桌面）';
+  el.innerHTML = '<b>准备发送</b>会一次性做好两件事：<br>'
+    + '① 把上面的文字复制到剪贴板　② 把 ' + n + ' 张截图按顺序导出到 ' + dirTxt + ' 里的新建子文件夹<br>'
+    + '然后你到群里：<b>Ctrl+V 粘文字</b> → 打开那个文件夹<b>全选图片拖进聊天窗口</b>。'
+    + '文字是真文本，以后<b>搜索得到</b>。';
+}
+
 
 /* ------------------- 极简 ZIP（仅存储，不压缩） ------------------- */
 let CRC_TABLE = null;
@@ -1363,7 +1504,7 @@ async function exportAll() {
       images: images
     };
     const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
-    const stamp = fmtTime(Date.now()).replace(/[-: ]/g, '');
+    const stamp = stamp14();
     downloadBlob(blob, '反馈记录备份_' + stamp + '.json');
     toast('已导出 ' + records.length + ' 条记录 / ' + images.length + ' 张图片', 'ok');
   } catch (e) {
@@ -1451,8 +1592,7 @@ function bindEvents() {
     copyText(tpl.format(state.current.values, state.images.length).trim());
   };
 
-  $('#btnCopyRich').onclick = copySummaryImage;
-  $('#btnSaveImg').onclick = downloadSummaryImage;
+  $('#btnPrepare').onclick = prepareSend;
 
   $('#btnClearForm').onclick = async () => {
     if (!confirm('清空当前这条记录的全部内容和附件？（记录本身会保留）')) return;
@@ -1466,6 +1606,7 @@ function bindEvents() {
     syncImageCount();
     renderForm();
     renderImages();
+    renderSendHint();
     renderPreview();
     renderHistory();
     await saveCurrent(true);
@@ -1538,6 +1679,7 @@ async function init() {
 
   state.pins = (await dbMetaGet('pins')) || {};
   state.lastUsed = (await dbMetaGet('lastUsed')) || {};
+  try { dirHandle = (await dbMetaGet('exportDir')) || null; } catch (e) { dirHandle = null; }
 
   const all = await dbRecordsAll();
   all.sort((a, b) => b.updatedAt - a.updatedAt);
@@ -1567,6 +1709,11 @@ window.__FB = {
   crc32: crc32,
   buildSummaryImage: buildSummaryImage,
   copySummaryImage: copySummaryImage,
+  prepareSend: prepareSend,
+  exportImagesToFolder: exportImagesToFolder,
+  fileBase: fileBase,
+  setDirHandle: (h) => { dirHandle = h; renderSendHint(); },
+  getDirHandle: () => dirHandle,
   saveCurrent: saveCurrent,
   loadRecord: loadRecord,
   renderImages: renderImages,
