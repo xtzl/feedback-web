@@ -303,8 +303,7 @@ const state = {
   records: [],          // 全部记录（按 updatedAt 倒序）
   current: null,        // 当前记录
   images: [],           // 当前记录的图片
-  pins: {},             // fieldId -> 常用值
-  lastUsed: {},         // templateId -> { fieldId: value }
+  pins: {},             // fieldId -> 常用值（点字段下面的胶囊填入，不自动预填）
   currentByTemplate: {},// templateId -> recordId
   filter: '',
   lbIndex: 0
@@ -434,15 +433,12 @@ function syncImageCount() {
 function newRecord(templateId) {
   const tpl = TEMPLATES[templateId];
   const values = {};
+  // 新建一律留空：不带上一条的门店/加密狗/版本，
+  // 避免手一滑把上一个门店的信息发给下一个客户。
+  // 常用信息改成字段下面的胶囊，点一下才填。
   (tpl.fields || []).forEach(f => {
     if (f.type === 'images') return;
-    if (f.sticky) {
-      const pin = state.pins[f.id];
-      const last = (state.lastUsed[templateId] || {})[f.id];
-      values[f.id] = (pin !== undefined && pin !== '') ? pin : (last || '');
-    } else {
-      values[f.id] = '';
-    }
+    values[f.id] = '';
   });
   const now = Date.now();
   return {
@@ -492,16 +488,6 @@ async function saveCurrent(immediate) {
   setSaveState(true);
   try {
     await dbRecordPut(rec);
-
-    // 记忆本模板最近一次填写的值
-    const remembered = {};
-    (TEMPLATES[rec.template].fields || []).forEach(f => {
-      if (f.type === 'images') return;
-      const val = rec.values[f.id];
-      if (val && String(val).trim()) remembered[f.id] = val;
-    });
-    state.lastUsed[rec.template] = remembered;
-    await dbMetaSet('lastUsed', state.lastUsed);
 
     // 合并进列表
     const idx = state.records.findIndex(r => r.id === rec.id);
@@ -611,7 +597,9 @@ function buildField(f) {
     const pin = document.createElement('button');
     pin.type = 'button';
     pin.className = 'pin' + (state.pins[f.id] ? ' on' : '');
-    pin.title = state.pins[f.id] ? '已设为常用（点一下取消）' : '设为常用信息，新建时自动填充';
+    pin.title = state.pins[f.id]
+      ? '已存为常用（点一下取消）'
+      : '把当前内容存为常用，之后字段下面会出现一个可点选的胶囊';
     pin.textContent = '📌';
     pin.onclick = async (e) => {
       e.preventDefault();
@@ -619,16 +607,17 @@ function buildField(f) {
       if (state.pins[f.id]) {
         delete state.pins[f.id];
         pin.classList.remove('on');
-        pin.title = '设为常用信息，新建时自动填充';
+        pin.title = '把当前内容存为常用，之后字段下面会出现一个可点选的胶囊';
         toast('已取消常用');
       } else {
         if (!val || !String(val).trim()) { toast('先填内容，再点 📌 存为常用', 'err'); return; }
         state.pins[f.id] = val;
         pin.classList.add('on');
-        pin.title = '已设为常用（点一下取消）';
-        toast('已存为常用信息', 'ok');
+        pin.title = '已存为常用（点一下取消）';
+        toast('已存为常用，下次点胶囊就能填入', 'ok');
       }
       await dbMetaSet('pins', state.pins);
+      renderChips();
     };
     label.appendChild(pin);
   }
@@ -665,24 +654,41 @@ function buildField(f) {
   });
   wrap.appendChild(input);
 
-  if (f.quick && f.quick.length) {
-    const chips = document.createElement('div');
-    chips.className = 'chips';
-    f.quick.forEach(q => {
+  /* 字段下方的快捷胶囊：📌 常用信息 + 预置候选词，点一下填入 */
+  const chipsBox = document.createElement('div');
+  chipsBox.className = 'chips';
+  wrap.appendChild(chipsBox);
+
+  function fillValue(v) {
+    input.value = v;
+    state.current.values[f.id] = v;
+    renderPreview();
+    debouncedSave();
+  }
+
+  function renderChips() {
+    chipsBox.innerHTML = '';
+    const pv = state.pins[f.id];
+    if (pv) {
+      const c = document.createElement('button');
+      c.type = 'button';
+      c.className = 'chip pinned';
+      c.title = '常用信息，点一下填入这个字段';
+      c.textContent = '📌 ' + (String(pv).length > 26 ? String(pv).slice(0, 26) + '…' : pv);
+      c.onclick = () => fillValue(pv);
+      chipsBox.appendChild(c);
+    }
+    (f.quick || []).forEach(q => {
       const c = document.createElement('button');
       c.type = 'button';
       c.className = 'chip';
       c.textContent = q;
-      c.onclick = () => {
-        input.value = q;
-        state.current.values[f.id] = q;
-        renderPreview();
-        debouncedSave();
-      };
-      chips.appendChild(c);
+      c.onclick = () => fillValue(q);
+      chipsBox.appendChild(c);
     });
-    wrap.appendChild(chips);
+    chipsBox.style.display = chipsBox.children.length ? '' : 'none';
   }
+  renderChips();
 
   if (f.urgency) {
     const d = document.createElement('details');
@@ -1934,7 +1940,6 @@ async function init() {
   }
 
   state.pins = (await dbMetaGet('pins')) || {};
-  state.lastUsed = (await dbMetaGet('lastUsed')) || {};
   try { dirHandle = (await dbMetaGet('exportDir')) || null; } catch (e) { dirHandle = null; }
 
   const all = await dbRecordsAll();
