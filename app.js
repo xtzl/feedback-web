@@ -978,6 +978,237 @@ function dataUrlToBlob(dataUrl, type) {
   return new Blob([arr], { type: mime });
 }
 
+/* ---------------------------------------------------------
+   11.5 图文长图：把成稿文字 + 全部截图合成一张图
+   （浏览器剪贴板一次只能放一张图，微信/企微也不支持一次粘贴多图，
+     所以用「合成一张长图」来做到一次粘贴发完整条反馈）
+   --------------------------------------------------------- */
+const IMG_W = 1000;            // 逻辑宽度
+const IMG_PAD = 44;
+const IMG_DPR = 2;             // 2 倍图，粘到聊天窗口更清晰
+const IMG_MAX_IMG_H = 9000;    // 所有截图累计高度上限，超出则等比缩小
+
+const IMG_FONT = '"Microsoft YaHei","PingFang SC","Hiragino Sans GB","Segoe UI",sans-serif';
+
+async function buildSummaryImage() {
+  const tpl = TEMPLATES[state.current.template];
+  const text = (tpl.format(state.current.values, state.images.length) || '').trim()
+    || '（暂无可导出的内容）';
+
+  const FS = 17, LH = 30;
+  const contentW = IMG_W - IMG_PAD * 2;
+  const fBody  = '400 ' + FS + 'px ' + IMG_FONT;
+  const fLabel = '600 ' + FS + 'px ' + IMG_FONT;
+  const fTitle = '600 26px ' + IMG_FONT;
+  const fSub   = '400 14px ' + IMG_FONT;
+  const fCap   = '600 15px ' + IMG_FONT;
+
+  const probe = document.createElement('canvas').getContext('2d');
+  const meas = (t, f) => { probe.font = f; return probe.measureText(t).width; };
+
+  /* --- 文本折行：把 "标签：内容" 拆开，标签加粗，内容在剩余宽度里折行 --- */
+  const visRows = [];
+  for (const src of text.split('\n')) {
+    if (!src.trim()) { visRows.push({ label: '', body: '' }); continue; }
+
+    const mm = src.match(/^([^：]{1,14})：/);
+    const label = mm ? mm[1] + '：' : '';
+    let rest = mm ? src.slice(mm[0].length) : src;
+
+    let labelW = label ? meas(label, fLabel) : 0;
+    let first = true;
+
+    // 标签本身就把一行占满了，那就标签单独一行
+    if (labelW > contentW - 60) {
+      visRows.push({ label: label, body: '' });
+      labelW = 0; first = false;
+    }
+    if (!rest) { visRows.push({ label: label, body: '' }); continue; }
+
+    let guard = 0;
+    while (rest.length && guard++ < 800) {
+      const avail = first ? contentW - labelW : contentW;
+      let line = '';
+      for (const ch of Array.from(rest)) {
+        if (line && meas(line + ch, fBody) > avail) break;
+        line += ch;
+      }
+      if (!line) line = Array.from(rest)[0];      // 保底：至少吃掉一个字符，绝不死循环
+      visRows.push({ label: first ? label : '', body: line });
+      rest = rest.slice(line.length);
+      first = false;
+    }
+  }
+
+  /* --- 加载截图 --- */
+  const loaded = [];
+  for (const im of state.images) {
+    try { loaded.push({ el: await loadImage(im.dataUrl), name: im.name }); }
+    catch (e) { /* 单张坏了就跳过 */ }
+  }
+
+  const CAP_H = 28, IMG_GAP = 18, SEP_GAP = 30;
+  const rawH = loaded.map(o => contentW * (o.el.naturalHeight / o.el.naturalWidth));
+  const sumRaw = rawH.reduce((a, b) => a + b, 0);
+  const scale = sumRaw > IMG_MAX_IMG_H ? IMG_MAX_IMG_H / sumRaw : 1;
+
+  /* --- 计算画布高度 --- */
+  let y = IMG_PAD;
+  y += 36;              // 标题
+  y += 22;              // 副标题
+  y += 24;              // 分隔线
+  const textTop = y;
+  y = textTop + visRows.length * LH;
+
+  if (loaded.length) {
+    y += SEP_GAP + 1;
+    loaded.forEach((o, i) => {
+      y += CAP_H;
+      y += rawH[i] * scale;
+      y += IMG_GAP;
+    });
+    y -= IMG_GAP;
+  }
+  y += 26;
+  const H = Math.ceil(y + 22 + IMG_PAD);
+
+  /* --- 绘制 --- */
+  const cv = document.createElement('canvas');
+  cv.width = IMG_W * IMG_DPR;
+  cv.height = H * IMG_DPR;
+  const ctx = cv.getContext('2d');
+  ctx.scale(IMG_DPR, IMG_DPR);
+  ctx.textBaseline = 'top';
+
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, IMG_W, H);
+  ctx.fillStyle = '#2563eb';
+  ctx.fillRect(0, 0, IMG_W, 6);
+
+  const now = fmtTime(Date.now());
+  let cy = IMG_PAD;
+
+  ctx.font = fTitle; ctx.fillStyle = '#1b1f24';
+  ctx.fillText(tpl.title, IMG_PAD, cy);
+  ctx.font = fSub; ctx.fillStyle = '#8a94a6';
+  ctx.textAlign = 'right';
+  ctx.fillText(now, IMG_W - IMG_PAD, cy + 11);
+  ctx.textAlign = 'left';
+  cy += 36;
+
+  ctx.font = fSub; ctx.fillStyle = '#8a94a6';
+  ctx.fillText(loaded.length ? '附件 ' + loaded.length + ' 张' : '无附件', IMG_PAD, cy);
+  cy += 22;
+
+  ctx.strokeStyle = '#e4e7ec'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(IMG_PAD, cy + 8.5); ctx.lineTo(IMG_W - IMG_PAD, cy + 8.5); ctx.stroke();
+  cy += 24;
+
+  for (const row of visRows) {
+    if (row.label) {
+      ctx.font = fLabel; ctx.fillStyle = '#3d4757';
+      ctx.fillText(row.label, IMG_PAD, cy);
+    }
+    if (row.body) {
+      const lw = row.label ? meas(row.label, fLabel) : 0;
+      ctx.font = fBody; ctx.fillStyle = '#1b1f24';
+      ctx.fillText(row.body, IMG_PAD + lw, cy);
+    }
+    cy += LH;
+  }
+
+  if (loaded.length) {
+    cy += SEP_GAP;
+    ctx.strokeStyle = '#e4e7ec';
+    ctx.beginPath(); ctx.moveTo(IMG_PAD, cy + 0.5); ctx.lineTo(IMG_W - IMG_PAD, cy + 0.5); ctx.stroke();
+    cy += 1;
+
+    loaded.forEach((o, i) => {
+      ctx.font = fCap; ctx.fillStyle = '#5b6577';
+      ctx.fillText((i + 1) + '.  ' + o.name, IMG_PAD, cy + 4);
+      cy += CAP_H;
+
+      const iw = contentW * scale;
+      const ih = rawH[i] * scale;
+      const ix = IMG_PAD + (contentW - iw) / 2;
+
+      ctx.fillStyle = '#f6f7f9';
+      ctx.fillRect(ix, cy, iw, ih);
+      ctx.drawImage(o.el, ix, cy, iw, ih);
+      ctx.strokeStyle = '#e4e7ec'; ctx.lineWidth = 1;
+      ctx.strokeRect(ix + 0.5, cy + 0.5, iw - 1, ih - 1);
+
+      cy += ih + IMG_GAP;
+    });
+    cy -= IMG_GAP;
+  }
+
+  cy += 26;
+  ctx.font = fSub; ctx.fillStyle = '#98a2b3';
+  ctx.fillText('本图由「售后反馈工作台」自动生成 · ' + now, IMG_PAD, cy);
+
+  return await new Promise((resolve, reject) => {
+    const fallback = () => {
+      try { resolve(dataUrlToBlob(cv.toDataURL('image/png'), 'image/png')); }
+      catch (e) { reject(e); }
+    };
+    if (typeof cv.toBlob !== 'function') { fallback(); return; }
+    let done = false;
+    try {
+      cv.toBlob(b => { done = true; b ? resolve(b) : fallback(); }, 'image/png');
+    } catch (e) { fallback(); return; }
+    // 某些环境 toBlob 不回调，兜底走 toDataURL
+    setTimeout(() => { if (!done) fallback(); }, 5000);
+  });
+}
+
+async function copySummaryImage() {
+  if (!state.current) return;
+  const tpl = TEMPLATES[state.current.template];
+  const text = (tpl.format(state.current.values, state.images.length) || '').trim();
+
+  if (!state.images.length) {
+    await copyText(text);
+    toast('这条记录还没有附件，已只复制文字');
+    return;
+  }
+
+  toast('正在合成图文长图…');
+  try {
+    const blob = await buildSummaryImage();
+
+    // 优先同时放入图片和纯文字：粘到聊天窗口是图，粘到文本编辑器是文字
+    try {
+      await navigator.clipboard.write([new ClipboardItem({
+        'image/png': blob,
+        'text/plain': new Blob([text || ' '], { type: 'text/plain' })
+      })]);
+    } catch (e) {
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+    }
+    toast('已复制「文字 + ' + state.images.length + ' 张图」，去群里直接粘贴', 'ok');
+  } catch (e) {
+    console.error(e);
+    toast('复制失败：' + (e && e.message ? e.message : e) + '　可点「长图」保存后手动发送', 'err');
+  }
+}
+
+async function downloadSummaryImage() {
+  if (!state.current) return;
+  toast('正在合成长图…');
+  try {
+    const blob = await buildSummaryImage();
+    const v = state.current.values;
+    const base = String(v.customer || v.problem || '反馈')
+      .replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 28);
+    downloadBlob(blob, base + '_' + fmtTime(Date.now()).replace(/[-: ]/g, '') + '_长图.png');
+    toast('长图已保存', 'ok');
+  } catch (e) {
+    console.error(e);
+    toast('合成失败：' + (e && e.message ? e.message : e), 'err');
+  }
+}
+
 async function copyImageToClipboard(im) {
   try {
     if (!navigator.clipboard || !window.ClipboardItem) throw new Error('浏览器不支持');
@@ -1215,10 +1446,13 @@ function bindEvents() {
     if (f) await importAll(f);
   });
 
-  $('#btnCopy').onclick = () => {
+  $('#btnCopyText').onclick = () => {
     const tpl = TEMPLATES[state.current.template];
     copyText(tpl.format(state.current.values, state.images.length).trim());
   };
+
+  $('#btnCopyRich').onclick = copySummaryImage;
+  $('#btnSaveImg').onclick = downloadSummaryImage;
 
   $('#btnClearForm').onclick = async () => {
     if (!confirm('清空当前这条记录的全部内容和附件？（记录本身会保留）')) return;
@@ -1331,6 +1565,8 @@ window.__FB = {
   TEMPLATES: TEMPLATES,
   makeZip: makeZip,
   crc32: crc32,
+  buildSummaryImage: buildSummaryImage,
+  copySummaryImage: copySummaryImage,
   saveCurrent: saveCurrent,
   loadRecord: loadRecord,
   renderImages: renderImages,
