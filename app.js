@@ -417,6 +417,7 @@ async function addFiles(fileList) {
   syncImageCount();
   renderImages();
   renderSendHint();
+  renderDirBox();
   renderHistory();
   scheduleSaveNow();
   if (ok) toast('已添加 ' + ok + ' 张图片', 'ok');
@@ -472,6 +473,7 @@ async function loadRecord(rec) {
   renderImages();
   renderPreview();
   renderSendHint();
+  renderDirBox();
   renderHistory();
   updateHeaderCount();
 }
@@ -830,6 +832,7 @@ function renderImages() {
       syncImageCount();
       renderImages();
       renderSendHint();
+      renderDirBox();
       renderPreview();
       renderHistory();
       await saveCurrent(true);
@@ -1288,8 +1291,9 @@ function downloadAllImages() {
    --------------------------------------------------------- */
 let dirHandle = null;
 
-function fileBase() {
-  const v = state.current.values;
+function fileBase(rec) {
+  const r = rec || state.current;
+  const v = (r && r.values) || {};
   return String(v.customer || v.problem || v.quote || '反馈')
     .replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 28) || '反馈';
 }
@@ -1299,6 +1303,22 @@ function stamp14(ts) {
   const d = new Date(ts || Date.now());
   return String(d.getFullYear()) + pad2(d.getMonth() + 1) + pad2(d.getDate())
     + pad2(d.getHours()) + pad2(d.getMinutes()) + pad2(d.getSeconds());
+}
+
+/** 所有照片都收在这个固定子目录下，方便日后回头找 */
+const PHOTO_ROOT = '售后反馈照片';
+
+/** 这条记录的文件夹名：客户名_20260913_2302 —— 一条反馈一个独立文件夹 */
+function recordFolderName(rec) {
+  rec = rec || state.current;
+  if (!rec) return PHOTO_ROOT;
+  // 已经导出过就锁定，避免客户名后来改动导致文件夹对不上
+  if (rec.photoFolder && rec.photoFolderLocked) return rec.photoFolder;
+  const d = new Date(rec.createdAt || Date.now());
+  const base = fileBase(rec);
+  rec.photoFolder = base + '_' + d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate())
+    + '_' + pad2(d.getHours()) + pad2(d.getMinutes());
+  return rec.photoFolder;
 }
 
 function pickDir() {
@@ -1319,15 +1339,28 @@ async function ensureDir(interactive) {
   const h = await pickDir();
   if (h) {
     dirHandle = h;
-    try { await dbMetaSet('exportDir', h); renderSendHint(); } catch (e) {}
+    try { await dbMetaSet('exportDir', h); } catch (e) {}
+    renderDirBox();
+    renderSendHint();
+    toast('照片会存到「' + h.name + '/' + PHOTO_ROOT + '」下面', 'ok');
   }
   return h;
 }
 
+/** 侧栏「照片存到哪」里点「选择/更改文件夹」 */
+function pickDirInteractive() {
+  if (!window.showDirectoryPicker) {
+    toast('当前浏览器不支持选择文件夹，请改用 Chrome 或 Edge', 'err');
+    return;
+  }
+  ensureDir(true);
+}
+
 /**
- * 把当前记录的全部截图按顺序写进用户指定的文件夹。
- * 每次新建一个以「客户名_时间」命名的子文件夹，避免和历史文件混在一起。
- * @returns {Promise<{dir:FileSystemDirectoryHandle, n:number}|null>}
+ * 把当前记录的全部截图按顺序写进
+ *   <你选的文件夹> / 售后反馈照片 / <客户名_日期_时间> / 01_xxx.png
+ * 同一条记录重复导出会写进同一个文件夹（不会每次都新建）。
+ * @returns {Promise<{dir:object, n:number, folder:string}|null>}
  */
 async function exportImagesToFolder(interactive) {
   if (!state.images.length) { toast('这条记录还没有附件', 'err'); return null; }
@@ -1341,12 +1374,13 @@ async function exportImagesToFolder(interactive) {
     return null;
   }
 
-  const subName = fileBase() + '_' + stamp14();
-  let sub;
+  const folder = recordFolderName();
+  let root, sub;
   try {
-    sub = await dir.getDirectoryHandle(subName, { create: true });
+    root = await dir.getDirectoryHandle(PHOTO_ROOT, { create: true });
+    sub = await root.getDirectoryHandle(folder, { create: true });
   } catch (e) {
-    toast('无法在该文件夹里新建子目录：' + (e && e.message ? e.message : e), 'err');
+    toast('无法在所选文件夹里建目录：' + (e && e.message ? e.message : e), 'err');
     return null;
   }
 
@@ -1367,7 +1401,17 @@ async function exportImagesToFolder(interactive) {
   }
 
   if (!n) { toast('图片写入失败，请检查文件夹权限', 'err'); return null; }
-  return { dir, sub, n, subName };
+
+  // 锁定文件夹名 + 记住导出时间
+  if (state.current) {
+    state.current.photoFolder = folder;
+    state.current.photoFolderLocked = true;
+    state.current.photoExportedAt = Date.now();
+    state.current.photoExportedCount = n;
+    await saveCurrent(true);
+  }
+  renderDirBox();
+  return { dir, n, folder };
 }
 
 async function prepareSend() {
@@ -1382,9 +1426,91 @@ async function prepareSend() {
 
   const r = await exportImagesToFolder(true);
   if (r) {
-    toast('文字已复制 · ' + r.n + ' 张图已存到「' + r.dir.name + '/' + r.subName + '」', 'ok');
+    toast('文字已复制 · ' + r.n + ' 张图已存到「' + PHOTO_ROOT + '/' + r.folder + '」', 'ok');
     renderSendHint();
+    renderDirBox();
   }
+}
+
+/* ---- 侧栏「照片存到哪」 ---- */
+function renderDirBox() {
+  const box = $('#dirBox');
+  if (!box) return;
+  box.innerHTML = '';
+
+  const n = state.images.length;
+  const folder = state.current ? recordFolderName(state.current) : PHOTO_ROOT;
+
+  const tree = document.createElement('div');
+  tree.className = 'dir-tree';
+
+  if (dirHandle) {
+    tree.appendChild(dirRow('📁', dirHandle.name, '你选的', 0));
+    tree.appendChild(dirRow('📁', PHOTO_ROOT, '总目录', 1));
+    tree.appendChild(dirRow('📂', folder, '这条反馈', 2, true));
+  } else {
+    const empty = document.createElement('div');
+    empty.className = 'empty-tip';
+    empty.style.padding = '14px 8px';
+    empty.textContent = '还没有选文件夹。点右上角「选择文件夹」挑一个位置，建议直接选桌面。';
+    tree.appendChild(empty);
+  }
+  box.appendChild(tree);
+
+  // 按钮
+  const acts = document.createElement('div');
+  acts.className = 'dir-actions';
+
+  const bPick = document.createElement('button');
+  bPick.className = 'btn sm';
+  bPick.textContent = dirHandle ? '更改文件夹' : '选择文件夹';
+  bPick.onclick = pickDirInteractive;
+  acts.appendChild(bPick);
+
+  if (n) {
+    const bGo = document.createElement('button');
+    bGo.className = 'btn sm primary';
+    bGo.textContent = '导出这 ' + n + ' 张';
+    bGo.onclick = async () => {
+      const r = await exportImagesToFolder(true);
+      if (r) toast('已导出 ' + r.n + ' 张到「' + PHOTO_ROOT + '/' + r.folder + '」', 'ok');
+    };
+    acts.appendChild(bGo);
+  }
+  box.appendChild(acts);
+
+  // 说明
+  const note = document.createElement('div');
+  note.className = 'dir-note';
+  if (!n) {
+    note.innerHTML = '左边加了截图后，点上面的按钮就能导出。'
+      + '<br>浏览器出于安全<b>不会告诉你文件夹的完整路径</b>，认准上面这个名字去找就行。';
+  } else if (state.current && state.current.photoExportedAt) {
+    note.innerHTML = '上次导出：' + fmtTime(state.current.photoExportedAt)
+      + '，共 ' + (state.current.photoExportedCount || 0) + ' 张。'
+      + '<br>同一份反馈反复导出会写进<b>同一个文件夹</b>，不会越导越多。';
+  } else {
+    note.innerHTML = '<b>一条反馈一个文件夹</b>，照片按 <b>01_、02_</b> 顺序命名，'
+      + '找照片直接进「' + PHOTO_ROOT + '」就行。';
+  }
+  box.appendChild(note);
+}
+
+function dirRow(icon, name, tag, level, isLast) {
+  const row = document.createElement('div');
+  row.className = 'dir-row' + (level ? ' lvl' + level : '') + (isLast ? ' last' : '');
+  const i = document.createElement('span');
+  i.className = 'ico'; i.textContent = icon;
+  const nm = document.createElement('span');
+  nm.className = 'nm'; nm.textContent = name;
+  nm.title = name;
+  row.appendChild(i); row.appendChild(nm);
+  if (tag) {
+    const t = document.createElement('span');
+    t.className = 'tag'; t.textContent = tag;
+    row.appendChild(t);
+  }
+  return row;
 }
 
 function renderSendHint() {
@@ -1393,14 +1519,16 @@ function renderSendHint() {
   const n = state.images.length;
   if (!n) {
     el.innerHTML = '这是<b>真文本</b> —— 复制后粘到群里可以选中、可以搜索。<br>'
-      + '左边加了截图后，这里会多出「准备发送」的完整流程提示。';
+      + '左边加了截图（直接 <b>Ctrl+V</b> 粘贴）后，这里会给出完整发送流程。';
     return;
   }
-  const dirTxt = dirHandle ? '<span class="dir">' + dirHandle.name + '</span>' : '<b>第一次点会弹窗让你选一个文件夹</b>（建议选桌面）';
-  el.innerHTML = '<b>准备发送</b>会一次性做好两件事：<br>'
-    + '① 把上面的文字复制到剪贴板　② 把 ' + n + ' 张截图按顺序导出到 ' + dirTxt + ' 里的新建子文件夹<br>'
-    + '然后你到群里：<b>Ctrl+V 粘文字</b> → 打开那个文件夹<b>全选图片拖进聊天窗口</b>。'
-    + '文字是真文本，以后<b>搜索得到</b>。';
+  const where = dirHandle
+    ? '「' + PHOTO_ROOT + '/' + recordFolderName(state.current) + '」'
+    : '你选的文件夹（第一次点会弹窗挑一个）';
+  el.innerHTML = '<b>准备发送</b>一次做两件事：<br>'
+    + '① 文字复制到剪贴板（真文本，可搜索）<br>'
+    + '② ' + n + ' 张截图按顺序导出到 ' + where + '<br>'
+    + '然后到群里：<b>Ctrl+V 粘文字</b> → 打开那个文件夹<b>全选图片拖进聊天窗口</b>。';
 }
 
 
@@ -1571,78 +1699,26 @@ function stepLightbox(d) {
 /* ---------------------------------------------------------
    14. 事件绑定
    --------------------------------------------------------- */
+/**
+ * 安全绑定：元素不存在时只警告、不抛错。
+ * 这样即使 HTML 和 JS 版本对不上（浏览器缓存了旧版页面），
+ * 也只是个别按钮失效，不会连粘贴、自动保存这些核心功能一起挂掉。
+ */
+function bind(sel, handler, evt) {
+  const el = typeof sel === 'string' ? $(sel) : sel;
+  if (!el) {
+    console.warn('[反馈工作台] 找不到 ' + sel + '，跳过绑定。'
+      + '如果页面功能异常，请按 Ctrl+F5 强制刷新清掉旧缓存。');
+    return null;
+  }
+  el.addEventListener(evt || 'click', handler);
+  return el;
+}
+
 function bindEvents() {
-  $('#btnNew').onclick = async () => {
-    if (state.current) await saveCurrent(true);
-    await createAndLoad(state.current ? state.current.template : 'internal');
-    toast('已新建记录', 'ok');
-  };
+  /* --- 核心功能优先绑定，绝不放在可能出错的位置之后 --- */
 
-  $('#btnExport').onclick = exportAll;
-
-  $('#btnImport').onclick = () => $('#jsonPicker').click();
-  $('#jsonPicker').addEventListener('change', async (e) => {
-    const f = e.target.files && e.target.files[0];
-    e.target.value = '';
-    if (f) await importAll(f);
-  });
-
-  $('#btnCopyText').onclick = () => {
-    const tpl = TEMPLATES[state.current.template];
-    copyText(tpl.format(state.current.values, state.images.length).trim());
-  };
-
-  $('#btnPrepare').onclick = prepareSend;
-
-  $('#btnClearForm').onclick = async () => {
-    if (!confirm('清空当前这条记录的全部内容和附件？（记录本身会保留）')) return;
-    const tpl = TEMPLATES[state.current.template];
-    (tpl.fields || []).forEach(f => {
-      if (f.type === 'images') return;
-      state.current.values[f.id] = '';
-    });
-    for (const im of state.images) await dbImageDel(im.id);
-    state.images = [];
-    syncImageCount();
-    renderForm();
-    renderImages();
-    renderSendHint();
-    renderPreview();
-    renderHistory();
-    await saveCurrent(true);
-    toast('已清空');
-  };
-
-  $('#filePicker').addEventListener('change', async (e) => {
-    const files = e.target.files;
-    e.target.value = '';
-    if (files && files.length) await addFiles(files);
-  });
-
-  $('#search').addEventListener('input', (e) => {
-    state.filter = e.target.value;
-    renderHistory();
-  });
-
-  // 灯箱
-  $('#lbClose').onclick = closeLightbox;
-  $('#lbPrev').onclick = () => stepLightbox(-1);
-  $('#lbNext').onclick = () => stepLightbox(1);
-  $('#lightbox').onclick = (e) => { if (e.target.id === 'lightbox') closeLightbox(); };
-
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeLightbox();
-    if ($('#lightbox').classList.contains('show')) {
-      if (e.key === 'ArrowLeft') stepLightbox(-1);
-      if (e.key === 'ArrowRight') stepLightbox(1);
-    }
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
-      e.preventDefault();
-      saveCurrent(true).then(() => toast('已保存', 'ok'));
-    }
-  });
-
-  // 全局粘贴图片
+  // 全局粘贴图片：在任意位置 Ctrl+V 都能把截图加进附件
   document.addEventListener('paste', (e) => {
     if (!state.current) return;
     const items = (e.clipboardData && e.clipboardData.items) || [];
@@ -1657,6 +1733,83 @@ function bindEvents() {
     e.preventDefault();
     addFiles(files);
   });
+
+  // 键盘：Esc 关灯箱、Ctrl+S 保存、灯箱左右翻页
+  document.addEventListener('keydown', (e) => {
+    const lb = $('#lightbox');
+    if (e.key === 'Escape') closeLightbox();
+    if (lb && lb.classList.contains('show')) {
+      if (e.key === 'ArrowLeft') stepLightbox(-1);
+      if (e.key === 'ArrowRight') stepLightbox(1);
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      saveCurrent(true).then(() => toast('已保存', 'ok'));
+    }
+  });
+
+  /* --- 顶部工具条 --- */
+  bind('#btnNew', async () => {
+    if (state.current) await saveCurrent(true);
+    await createAndLoad(state.current ? state.current.template : 'internal');
+    toast('已新建记录', 'ok');
+  });
+  bind('#btnExport', () => exportAll());
+  bind('#btnImport', () => { const p = $('#jsonPicker'); if (p) p.click(); });
+  bind('#jsonPicker', async (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (f) await importAll(f);
+  }, 'change');
+
+  /* --- 预览区 --- */
+  bind('#btnCopyText', () => {
+    const tpl = TEMPLATES[state.current.template];
+    copyText(tpl.format(state.current.values, state.images.length).trim());
+  });
+  bind('#btnPrepare', () => prepareSend());
+
+  /* --- 表单 --- */
+  bind('#btnClearForm', async () => {
+    if (!confirm('清空当前这条记录的全部内容和附件？（记录本身会保留）')) return;
+    const tpl = TEMPLATES[state.current.template];
+    (tpl.fields || []).forEach(f => {
+      if (f.type === 'images') return;
+      state.current.values[f.id] = '';
+    });
+    for (const im of state.images) await dbImageDel(im.id);
+    state.images = [];
+    syncImageCount();
+    renderForm();
+    renderImages();
+    renderSendHint();
+    renderDirBox();
+    renderPreview();
+    renderHistory();
+    await saveCurrent(true);
+    toast('已清空');
+  });
+
+  bind('#filePicker', async (e) => {
+    const files = e.target.files;
+    e.target.value = '';
+    if (files && files.length) await addFiles(files);
+  }, 'change');
+
+  /* --- 照片文件夹 --- */
+  bind('#btnPickDir', () => pickDirInteractive());
+
+  /* --- 历史搜索 --- */
+  bind('#search', (e) => {
+    state.filter = e.target.value;
+    renderHistory();
+  }, 'input');
+
+  /* --- 灯箱 --- */
+  bind('#lbClose', closeLightbox);
+  bind('#lbPrev', () => stepLightbox(-1));
+  bind('#lbNext', () => stepLightbox(1));
+  bind('#lightbox', (e) => { if (e.target.id === 'lightbox') closeLightbox(); });
 }
 
 /* ---------------------------------------------------------
@@ -1712,7 +1865,12 @@ window.__FB = {
   prepareSend: prepareSend,
   exportImagesToFolder: exportImagesToFolder,
   fileBase: fileBase,
-  setDirHandle: (h) => { dirHandle = h; renderSendHint(); },
+  recordFolderName: recordFolderName,
+  renderDirBox: renderDirBox,
+  renderSendHint: renderSendHint,
+  PHOTO_ROOT: PHOTO_ROOT,
+  bind: bind,
+  setDirHandle: (h) => { dirHandle = h; renderDirBox(); renderSendHint(); },
   getDirHandle: () => dirHandle,
   saveCurrent: saveCurrent,
   loadRecord: loadRecord,
