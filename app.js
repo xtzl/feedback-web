@@ -1272,17 +1272,19 @@ function downloadOneImage(im, i) {
 
 function downloadAllImages() {
   if (!state.images.length) { toast('还没有图片', 'err'); return; }
-  const v = state.current.values;
+  const path = recordRelPath();
   const stamp = stamp14();
-  const base = ((v.customer || v.problem || '反馈') + '_' + stamp)
-    .replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40);
 
+  /* zip 内部也按「日期/客户_时间/01.png」排，解压出来和直接导出的目录结构一致 */
   const files = state.images.map((im, i) => {
     const ext = im.type === 'image/jpeg' ? '.jpg' : '.png';
-    return { name: base + '_' + pad2(i + 1) + ext, blob: dataUrlToBlob(im.dataUrl, im.type) };
+    const nm = path.rel + '/' + pad2(i + 1) + '_'
+      + String(im.name || '截图').replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|\s]+/g, '_');
+    return { name: nm + ext, blob: dataUrlToBlob(im.dataUrl, im.type) };
   });
+  const zipName = path.rel.replace(/\//g, '_') + '_' + stamp + '.zip';
   makeZip(files).then(blob => {
-    downloadBlob(blob, base + '.zip');
+    downloadBlob(blob, zipName);
     toast('已打包 ' + files.length + ' 张图片', 'ok');
   }).catch(err => {
     console.error(err);
@@ -1311,20 +1313,52 @@ function stamp14(ts) {
     + pad2(d.getHours()) + pad2(d.getMinutes()) + pad2(d.getSeconds());
 }
 
+/** 日期文件夹名：2026-09-13 —— 按反馈创建那天归堆，一天一个文件夹 */
+function dayFolderName(ts) {
+  const d = new Date(ts || Date.now());
+  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+}
+
 /** 所有照片都收在这个固定子目录下，方便日后回头找 */
 const PHOTO_ROOT = '售后反馈照片';
 
-/** 这条记录的文件夹名：客户名_20260913_2302 —— 一条反馈一个独立文件夹 */
-function recordFolderName(rec) {
+/**
+ * 这条记录在「售后反馈照片」下的相对路径：2026-09-13/满乃是_2306
+ * —— 先按日期分文件夹，日期下面一条反馈一个独立文件夹。
+ * 已经导出过就锁定，避免客户名后来改动导致文件夹对不上。
+ * @returns {{day:string, folder:string, rel:string}}
+ */
+function recordRelPath(rec) {
   rec = rec || state.current;
-  if (!rec) return PHOTO_ROOT;
-  // 已经导出过就锁定，避免客户名后来改动导致文件夹对不上
-  if (rec.photoFolder && rec.photoFolderLocked) return rec.photoFolder;
-  const d = new Date(rec.createdAt || Date.now());
-  const base = fileBase(rec);
-  rec.photoFolder = base + '_' + d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate())
-    + '_' + pad2(d.getHours()) + pad2(d.getMinutes());
-  return rec.photoFolder;
+  if (!rec) return { day: dayFolderName(), folder: '', rel: dayFolderName() };
+
+  if (rec.photoFolderLocked && rec.photoRelPath) {
+    const i = rec.photoRelPath.indexOf('/');
+    if (i > 0) {
+      return {
+        day: rec.photoRelPath.slice(0, i),
+        folder: rec.photoRelPath.slice(i + 1),
+        rel: rec.photoRelPath
+      };
+    }
+    return { day: '', folder: rec.photoRelPath, rel: rec.photoRelPath };
+  }
+
+  const day = dayFolderName(rec.createdAt);
+  let folder;
+  if (rec.photoFolderLocked && rec.photoFolder) {
+    // 老版本的名字是「客户名_20260913_2306」，日期改由上级文件夹承载，去掉重复那一段
+    folder = String(rec.photoFolder).replace(/_(\d{8})(_\d{4})$/, '$2');
+  } else {
+    const d = new Date(rec.createdAt || Date.now());
+    folder = fileBase(rec) + '_' + pad2(d.getHours()) + pad2(d.getMinutes());
+  }
+  return { day: day, folder: folder, rel: day + '/' + folder };
+}
+
+/** 兼容旧调用：只要叶子文件夹名 */
+function recordFolderName(rec) {
+  return recordRelPath(rec).folder || PHOTO_ROOT;
 }
 
 function pickDir() {
@@ -1387,10 +1421,11 @@ async function listWrittenFiles(sub) {
 
 /**
  * 把当前记录的全部截图按顺序写进
- *   <你选的文件夹> / 售后反馈照片 / <客户名_日期_时间> / 01_xxx.png
+ *   <你选的文件夹> / 售后反馈照片 / <日期> / <客户名_时间> / 01_xxx.png
+ * 日期取这条反馈的创建日，同一天的所有反馈收在同一个日期文件夹里。
  * 写完后**回读目录核对**，只有真的读到文件才算成功。
  * 同一条记录重复导出会写进同一个文件夹（不会每次都新建）。
- * @returns {Promise<{dir:object, n:number, folder:string, files:Array}|null>}
+ * @returns {Promise<{dir:object, n:number, folder:string, rel:string, files:Array}|null>}
  */
 async function exportImagesToFolder(interactive) {
   if (!state.images.length) { toast('这条记录还没有附件', 'err'); return null; }
@@ -1404,11 +1439,13 @@ async function exportImagesToFolder(interactive) {
     return null;
   }
 
-  const folder = recordFolderName();
-  let root, sub;
+  const path = recordRelPath();
+  const folder = path.folder;
+  let root, dayDir, sub;
   try {
     root = await dir.getDirectoryHandle(PHOTO_ROOT, { create: true });
-    sub = await root.getDirectoryHandle(folder, { create: true });
+    dayDir = path.day ? await root.getDirectoryHandle(path.day, { create: true }) : root;
+    sub = await dayDir.getDirectoryHandle(folder, { create: true });
   } catch (e) {
     toast('无法在「' + dir.name + '」里建目录：' + (e && e.message ? e.message : e)
       + '　请确认这个文件夹允许写入', 'err');
@@ -1440,6 +1477,7 @@ async function exportImagesToFolder(interactive) {
       + '」这个文件夹允许写入', 'err');
     state.current.photoFiles = [];
     state.current.photoFolderLocked = false;
+    state.current.photoRelPath = '';
     state.current.photoExportedAt = 0;
     await saveCurrent(true);
     renderDirBox();
@@ -1447,6 +1485,8 @@ async function exportImagesToFolder(interactive) {
     return null;
   }
 
+  state.current.photoRelPath = path.rel;
+  state.current.photoDay = path.day;
   state.current.photoFolder = folder;
   state.current.photoFolderLocked = true;
   state.current.photoFiles = good;
@@ -1457,7 +1497,7 @@ async function exportImagesToFolder(interactive) {
   renderSendHint();
 
   if (failed) toast('有 ' + failed + ' 张写入失败，已成功 ' + good.length + ' 张', 'err');
-  return { dir, n: good.length, folder, files: good };
+  return { dir, n: good.length, folder, rel: path.rel, files: good };
 }
 
 async function prepareSend() {
@@ -1482,7 +1522,9 @@ function renderDirBox() {
 
   const rec = state.current;
   const n = state.images.length;
-  const folder = rec ? recordFolderName(rec) : PHOTO_ROOT;
+  const path = recordRelPath(rec);
+  const folder = path.folder || PHOTO_ROOT;
+  const dayName = path.folder ? path.day : '';
   const done = !!(rec && rec.photoExportedAt && (rec.photoFiles || []).length);
 
   /* --- 还没选文件夹 --- */
@@ -1524,7 +1566,10 @@ function renderDirBox() {
   tree.className = 'dir-tree';
   tree.appendChild(dirRow(dirHandle.name, '你选的', 0, false, true));
   tree.appendChild(dirRow(PHOTO_ROOT, done ? '已创建' : '待创建', 1, false, done));
-  tree.appendChild(dirRow(folder, done ? '已创建' : '待创建', 2, true, done));
+  if (dayName) {
+    tree.appendChild(dirRow(dayName, done ? '已创建' : '待创建', 2, false, done));
+  }
+  tree.appendChild(dirRow(folder, done ? '已创建' : '待创建', dayName ? 3 : 2, true, done));
   box.appendChild(tree);
 
   /* --- 按钮 --- */
@@ -1579,7 +1624,8 @@ function renderDirBox() {
     note.className = 'dir-note';
     note.innerHTML = '上面就是<b>真实读回来的文件清单</b>，'
       + '到系统里打开这个文件夹核对一下。'
-      + '同一条反馈反复导出只会覆盖同一个文件夹。';
+      + '照片按<b>反馈日期</b>分文件夹，同一天的在同一个日期文件夹里，'
+      + '同一条反馈反复导出只会覆盖它自己那一格。';
     box.appendChild(note);
   } else {
     const note = document.createElement('div');
@@ -1623,7 +1669,7 @@ function renderSendHint() {
   const rec = state.current;
   const done = !!(rec && rec.photoExportedAt && (rec.photoFiles || []).length);
   const where = dirHandle
-    ? '「' + PHOTO_ROOT + ' / ' + recordFolderName(rec) + '」'
+    ? '「' + [PHOTO_ROOT].concat((recordRelPath(rec).rel || '').split('/')).join(' / ') + '」'
     : '你选定的文件夹（第一次点会弹窗挑一个）';
 
   if (done) {
