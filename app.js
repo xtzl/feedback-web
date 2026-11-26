@@ -733,7 +733,7 @@ function buildImagesField(f) {
   btnDir.className = 'btn sm';
   btnDir.textContent = '导出图片';
   btnDir.title = '把全部截图按顺序写入你指定的文件夹，方便一次拖进聊天窗口';
-  btnDir.onclick = () => exportImagesToFolder(true);
+  btnDir.onclick = () => runExport(btnDir);
   sp.appendChild(btnDir);
 
   const btnZip = document.createElement('button');
@@ -1270,9 +1270,11 @@ function downloadOneImage(im, i) {
   downloadBlob(blob, base + '_' + pad2(i + 1) + ext);
 }
 
-function downloadAllImages() {
+async function downloadAllImages() {
   if (!state.images.length) { toast('还没有图片', 'err'); return; }
-  const path = recordRelPath();
+
+  let path;
+  try { path = recordRelPath(); } catch (e) { path = { rel: '反馈' }; }
   const stamp = stamp14();
 
   /* zip 内部也按「日期/客户_时间/01.png」排，解压出来和直接导出的目录结构一致 */
@@ -1283,14 +1285,16 @@ function downloadAllImages() {
     return { name: nm + ext, blob: dataUrlToBlob(im.dataUrl, im.type) };
   });
   const zipName = path.rel.replace(/\//g, '_') + '_' + stamp + '.zip';
-  makeZip(files).then(blob => {
+
+  try {
+    const blob = await makeZip(files);
     downloadBlob(blob, zipName);
     toast('已打包 ' + files.length + ' 张图片', 'ok');
-  }).catch(err => {
-    console.error(err);
-    toast('打包失败，改为逐张下载', 'err');
+  } catch (err) {
+    console.error('[导出] 打包失败', err);
+    toast('打包失败，改为逐张下载（浏览器可能会问是否允许下载多个文件）', 'err');
     state.images.forEach((im, i) => setTimeout(() => downloadOneImage(im, i), i * 350));
-  });
+  }
 }
 
 /* ---------------------------------------------------------
@@ -1298,6 +1302,8 @@ function downloadAllImages() {
    —— 文字走剪贴板保持"真文本"（可搜索），图片走文件保持"真图片"
    --------------------------------------------------------- */
 let dirHandle = null;
+/** 保存的文件夹当前授权状态：granted / prompt / denied / none / unknown */
+let dirPerm = 'unknown';
 
 function fileBase(rec) {
   const r = rec || state.current;
@@ -1361,39 +1367,119 @@ function recordFolderName(rec) {
   return recordRelPath(rec).folder || PHOTO_ROOT;
 }
 
-function pickDir() {
-  if (!window.showDirectoryPicker) return Promise.resolve(null);
-  return window.showDirectoryPicker({ id: 'fb-export', mode: 'readwrite', startIn: 'desktop' })
-    .catch(() => null);      // 用户取消
+/** 浏览器是否支持「选一个文件夹写文件」（Chrome / Edge 支持） */
+function hasDirPicker() {
+  return typeof window.showDirectoryPicker === 'function';
 }
 
+/** 把异常翻译成人能看懂的一句话 */
+function errText(e) {
+  if (!e) return '未知错误';
+  if (e.name === 'SecurityError') return '浏览器拦住了弹窗（需要点击手势，或当前页面不允许）';
+  if (e.name === 'NotAllowedError') return '浏览器拒绝了访问权限';
+  if (e.name === 'AbortError') return '你取消了选择';
+  return e.message || String(e);
+}
+
+/**
+ * 弹系统的文件夹选择器。
+ * 用户取消（AbortError）和真正出错必须分开：出错要一路抛给调用方显示出来，
+ * 否则表现就是「点了没反应」。
+ * @returns {Promise<{handle:object|null, reason:'ok'|'cancel'|'unsupported'|'error', error?:Error}>}
+ */
+function pickDir() {
+  if (!hasDirPicker()) return Promise.resolve({ handle: null, reason: 'unsupported' });
+
+  let p;
+  try {
+    p = window.showDirectoryPicker({ id: 'fb-export', mode: 'readwrite', startIn: 'desktop' });
+  } catch (e) {
+    // 个别版本不认识 startIn，去掉重试一次
+    try { p = window.showDirectoryPicker({ id: 'fb-export', mode: 'readwrite' }); }
+    catch (e2) {
+      console.error('[导出] 文件夹选择器打不开', e2);
+      return Promise.resolve({ handle: null, reason: 'error', error: e2 });
+    }
+  }
+  return Promise.resolve(p)
+    .then(h => ({ handle: h, reason: 'ok' }))
+    .catch(err => {
+      if (err && err.name === 'AbortError') return { handle: null, reason: 'cancel' };
+      console.error('[导出] 文件夹选择器报错', err);
+      return { handle: null, reason: 'error', error: err };
+    });
+}
+
+/**
+ * 浏览器重启 / 换标签页后，已保存文件夹的写入权限会退回「prompt」。
+ * 必须在页面加载时就查清楚，不能在点击的那一刻才 await ——
+ * 否则 await 会把点击手势消耗掉，选择器弹不出来，用户看到的就是「点了没反应」。
+ */
+async function refreshDirPerm() {
+  if (!dirHandle) { dirPerm = 'none'; return dirPerm; }
+  try {
+    dirPerm = await dirHandle.queryPermission({ mode: 'readwrite' });
+  } catch (e) {
+    console.warn('[导出] 保存的文件夹句柄已失效', e);
+    dirPerm = 'denied';
+  }
+  return dirPerm;
+}
+
+/**
+ * 确保有一个可写的文件夹。
+ * @returns {Promise<{handle:object|null, reason:string, error?:Error}>}
+ *          reason: ok / cancel / unsupported / error / denied / none
+ */
 async function ensureDir(interactive) {
   if (dirHandle) {
-    try {
-      if (await dirHandle.queryPermission({ mode: 'readwrite' }) === 'granted') return dirHandle;
-      if (interactive && await dirHandle.requestPermission({ mode: 'readwrite' }) === 'granted') return dirHandle;
-    } catch (e) { /* 句柄失效，重新选 */ }
-    dirHandle = null;
+    if (dirPerm === 'unknown') await refreshDirPerm();
+    if (dirPerm === 'granted') return { handle: dirHandle, reason: 'ok' };
+
+    // 浏览器还愿意给一次「允许」小窗，先试；失败就立刻改成重新选文件夹
+    if (interactive && dirPerm === 'prompt') {
+      try {
+        if (await dirHandle.requestPermission({ mode: 'readwrite' }) === 'granted') {
+          dirPerm = 'granted';
+          return { handle: dirHandle, reason: 'ok' };
+        }
+      } catch (e) {
+        console.warn('[导出] 重新授权失败，改为重新选择文件夹', e);
+      }
+      dirPerm = 'denied';
+      renderDirBox();
+    }
   }
-  if (!interactive) return null;
-  const h = await pickDir();
-  if (h) {
-    dirHandle = h;
-    try { await dbMetaSet('exportDir', h); } catch (e) {}
+
+  if (!interactive) return { handle: null, reason: dirHandle ? 'denied' : 'none' };
+
+  // 这里的 showDirectoryPicker 必须是点击后的第一个 await，手势才不会被用掉
+  const r = await pickDir();
+  if (r.reason === 'ok') {
+    dirHandle = r.handle;
+    dirPerm = 'granted';
+    try { await dbMetaSet('exportDir', r.handle); } catch (e) {}
     renderDirBox();
     renderSendHint();
-    toast('照片会存到「' + h.name + '/' + PHOTO_ROOT + '」下面', 'ok');
+    toast('照片会存到「' + r.handle.name + '/' + PHOTO_ROOT + '」下面', 'ok');
+    return { handle: r.handle, reason: 'ok' };
   }
-  return h;
+  return { handle: null, reason: r.reason, error: r.error };
 }
 
 /** 侧栏「照片存到哪」里点「选择/更改文件夹」 */
 function pickDirInteractive() {
-  if (!window.showDirectoryPicker) {
-    toast('当前浏览器不支持选择文件夹，请改用 Chrome 或 Edge', 'err');
+  if (!hasDirPicker()) {
+    toast('这个浏览器不支持「选文件夹写入」，请改用 Chrome / Edge；也可以点「打包 zip」下载', 'err');
     return;
   }
-  ensureDir(true);
+  return ensureDir(true).then(r => {
+    if (r.reason === 'cancel') toast('已取消选择文件夹');
+    else if (r.reason === 'error') toast('打不开文件夹选择器：' + errText(r.error), 'err');
+  }).catch(e => {
+    console.error('[导出] 选择文件夹失败', e);
+    toast('选择文件夹失败：' + errText(e), 'err');
+  });
 }
 
 /**
@@ -1428,13 +1514,27 @@ async function listWrittenFiles(sub) {
  * @returns {Promise<{dir:object, n:number, folder:string, rel:string, files:Array}|null>}
  */
 async function exportImagesToFolder(interactive) {
-  if (!state.images.length) { toast('这条记录还没有附件', 'err'); return null; }
+  if (!state.current) { toast('还没有打开的记录', 'err'); return null; }
+  if (!state.images.length) { toast('这条记录还没有附件，先粘贴截图再导出', 'err'); return null; }
 
-  const dir = await ensureDir(interactive !== false);
+  const picked = await ensureDir(interactive !== false);
+  const dir = picked.handle;
+
+  /* 没拿到文件夹时，必须告诉用户发生了什么，并给一条走得通的路（打包 zip），
+     绝不静默返回 —— 静默就是「点了没反应」。 */
   if (!dir) {
-    if (!window.showDirectoryPicker) {
-      toast('当前浏览器不支持选择文件夹，已改为逐张下载', 'err');
-      state.images.forEach((im, i) => setTimeout(() => downloadOneImage(im, i), i * 320));
+    if (picked.reason === 'cancel') {
+      toast('已取消选择文件夹，照片没有导出。再点一次，或点「打包 zip」下载', 'err');
+    } else if (picked.reason === 'unsupported') {
+      toast('这个浏览器不支持写入文件夹，已改为打包下载 zip', 'err');
+      await downloadAllImages();
+    } else if (picked.reason === 'error') {
+      toast('文件夹弹窗打不开：' + errText(picked.error)
+        + (location.protocol === 'file:' ? '（你是用本地文件打开的，建议用部署好的网址）' : '')
+        + '。已改为打包下载 zip', 'err');
+      await downloadAllImages();
+    } else {
+      toast('没拿到文件夹的写入权限：点「选择文件夹」重新指定，或直接点「打包 zip」下载', 'err');
     }
     return null;
   }
@@ -1447,8 +1547,10 @@ async function exportImagesToFolder(interactive) {
     dayDir = path.day ? await root.getDirectoryHandle(path.day, { create: true }) : root;
     sub = await dayDir.getDirectoryHandle(folder, { create: true });
   } catch (e) {
-    toast('无法在「' + dir.name + '」里建目录：' + (e && e.message ? e.message : e)
-      + '　请确认这个文件夹允许写入', 'err');
+    const why = (e && e.name === 'NotFoundError')
+      ? '这个文件夹已经不在了（被移动或删除）'
+      : ('无法在「' + dir.name + '」里建目录：' + (e && e.message ? e.message : e));
+    toast(why + '　请点「更改文件夹」重新选一个位置，或先点「打包 zip」下载', 'err');
     return null;
   }
 
@@ -1503,15 +1605,41 @@ async function exportImagesToFolder(interactive) {
 async function prepareSend() {
   if (!state.current) return;
   const tpl = TEMPLATES[state.current.template];
-  const text = tpl.format(state.current.values, state.images.length).trim();
+  const text = (tpl.format(state.current.values, state.images.length) || '').trim();
 
   if (!text) { toast('还没有内容可以复制', 'err'); return; }
 
   await copyText(text);
   if (!state.images.length) return;
 
-  const r = await exportImagesToFolder(true);
-  if (r) toast('✓ 文字已复制 · ' + r.n + ' 个文件已确认写入', 'ok');
+  /* 导出这一环单独兜住异常：以前这里一抛错就整个静默，
+     文字复制了、照片却一张没动，用户以为按钮坏了。 */
+  try {
+    const r = await exportImagesToFolder(true);
+    if (r) toast('✓ 文字已复制 · ' + r.n + ' 个文件已确认写入', 'ok');
+  } catch (e) {
+    console.error('[导出] 准备发送时导出照片失败', e);
+    toast('导出照片出错：' + errText(e) + '，正在改为打包下载', 'err');
+    await downloadAllImages();
+  }
+}
+
+/**
+ * 「导出图片」统一入口：按钮置灰给出即时反馈，任何异常都弹提示，绝不静默。
+ */
+async function runExport(btn) {
+  if (btn && btn.disabled) return;
+  const label = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '导出中…'; }
+  try {
+    const r = await exportImagesToFolder(true);
+    if (r) toast('✓ 已确认写入 ' + r.n + ' 个文件到「' + r.rel + '」', 'ok');
+  } catch (e) {
+    console.error('[导出] 导出图片失败', e);
+    toast('导出失败：' + errText(e), 'err');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+  }
 }
 
 /* ---- 侧栏「照片存到哪」 ---- */
@@ -1552,7 +1680,16 @@ function renderDirBox() {
   }
 
   /* --- 有图但还没导出：醒目提醒 --- */
-  if (!done && n) {
+  if (dirPerm !== 'granted') {
+    const perm = document.createElement('div');
+    perm.className = 'dir-warn';
+    perm.innerHTML = '⚠️ <b>这个文件夹需要重新授权</b><br>'
+      + '浏览器重启或换标签页后会收回写入权限。点下面的「更改文件夹」重新选它一次'
+      + '（选同一个文件夹就行），或者直接用「打包 zip」下载。';
+    box.appendChild(perm);
+  }
+
+  if (!done && n && dirPerm === 'granted') {
     const warn = document.createElement('div');
     warn.className = 'dir-warn';
     warn.innerHTML = '⚠️ <b>照片还没有导出</b><br>'
@@ -1586,10 +1723,7 @@ function renderDirBox() {
     const bGo = document.createElement('button');
     bGo.className = 'btn sm primary';
     bGo.textContent = done ? '重新导出' : '导出这 ' + n + ' 张';
-    bGo.onclick = async () => {
-      const r = await exportImagesToFolder(true);
-      if (r) toast('✓ 已确认写入 ' + r.n + ' 个文件', 'ok');
-    };
+    bGo.onclick = () => runExport(bGo);
     acts.appendChild(bGo);
   }
   box.appendChild(acts);
@@ -1987,6 +2121,8 @@ async function init() {
 
   state.pins = (await dbMetaGet('pins')) || {};
   try { dirHandle = (await dbMetaGet('exportDir')) || null; } catch (e) { dirHandle = null; }
+  /* 提前查清授权状态，等用户点按钮时才查会把点击手势用掉，弹窗就出不来了 */
+  try { await refreshDirPerm(); } catch (e) { dirPerm = 'unknown'; }
 
   const all = await dbRecordsAll();
   all.sort((a, b) => b.updatedAt - a.updatedAt);
@@ -2024,8 +2160,17 @@ window.__FB = {
   renderSendHint: renderSendHint,
   PHOTO_ROOT: PHOTO_ROOT,
   bind: bind,
-  setDirHandle: (h) => { dirHandle = h; renderDirBox(); renderSendHint(); },
+  setDirHandle: async (h) => {
+    dirHandle = h;
+    dirPerm = 'unknown';
+    await refreshDirPerm();
+    renderDirBox();
+    renderSendHint();
+    return dirPerm;
+  },
   getDirHandle: () => dirHandle,
+  getDirPerm: () => dirPerm,
+  runExport: runExport,
   saveCurrent: saveCurrent,
   loadRecord: loadRecord,
   renderImages: renderImages,
